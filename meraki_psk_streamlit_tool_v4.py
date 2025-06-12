@@ -1,102 +1,94 @@
 import streamlit as st
-import requests, csv, io
-import random, string
+import requests, csv, io, random
 
-# Helper functions
-def random_psk():
-    word = ''.join(random.choices(string.ascii_lowercase, k=5))
-    # Make text easy: capitalize first and last
-    return word.capitalize()
+# --- PSK Generation Logic ---
+# Curated list of friendly words (replace with full 1000-word list)
+friendly_words = [
+    "apple", "bridge", "candle", "daisy", "eagle", "flower", "guitar", "hat",
+    "island", "jacket", "ladder", "marble", "notebook", "orange", "pillow", 
+    "quilt", "river", "sunset", "teapot", "umbrella", "vase", "window",
+    "xylophone", "yarn", "zebra", "anchor", "balloon", "cloud", "drum", 
+    "elephant", "feather", "garden", "hill", "igloo", "jungle", "kite", 
+    "lantern", "moon", "nest", "ocean", "penguin", "quiet", "rainbow", 
+    "shell", "tree", "under", "valley", "whale", "xray", "yonder", "zoo"
+]
 
-def fetch_orgs(api_key):
-    r = requests.get("https://api.meraki.com/api/v1/organizations",
-                     headers={"X-Cisco-Meraki-API-Key": api_key})
-    return r.json()
+def generate_friendly_psk():
+    w1, w2 = random.sample(friendly_words, 2)
+    def cap_one(word):
+        i = random.randint(0, len(word)-1)
+        return word[:i] + word[i].upper() + word[i+1:]
+    num = random.choice([n for n in range(10,100) if n != 69])
+    return f"{cap_one(w1)}{num}{cap_one(w2)}"
 
-def fetch_networks(api_key, org_id):
-    r = requests.get(f"https://api.meraki.com/api/v1/organizations/{org_id}/networks",
-                     headers={"X-Cisco-Meraki-API-Key": api_key})
-    return r.json()
+# --- Meraki API Helpers ---
+def meraki_get(path, api_key):
+    url = f"https://api.meraki.com/api/v1{path}"
+    return requests.get(url, headers={"X-Cisco-Meraki-API-Key": api_key}).json()
 
-def fetch_group_policies(api_key, net_id):
-    r = requests.get(f"https://api.meraki.com/api/v1/networks/{net_id}/groupPolicies",
-                     headers={"X-Cisco-Meraki-API-Key": api_key})
-    return r.json()
-
-def fetch_ssids(api_key, net_id):
-    r = requests.get(f"https://api.meraki.com/api/v1/networks/{net_id}/wireless/ssids",
-                     headers={"X-Cisco-Meraki-API-Key": api_key})
-    return r.json()
-
-def create_psk(api_key, net_id, ssid_num, name, passphrase, groupPolicyId):
-    r = requests.post(
-        f"https://api.meraki.com/api/v1/networks/{net_id}/wireless/ssids/{ssid_num}/identityPsks",
-        headers={"X-Cisco-Meraki-API-Key": api_key},
-        json={"name": name, "passphrase": passphrase, "groupPolicyId": groupPolicyId}
-    )
+def meraki_post(path, api_key, payload):
+    url = f"https://api.meraki.com/api/v1{path}"
+    r = requests.post(url, headers={"X-Cisco-Meraki-API-Key": api_key}, json=payload)
     return r.status_code, r.json()
 
-# UI
+# --- UI Frontend ---
 st.title("Meraki WPN PSK Provisioning Tool")
 
-api_key = st.text_input("Enter your Meraki API Key", type="password")
+api_key = st.text_input("Meraki API Key", type="password")
 if not api_key:
-    st.warning("API Key is required");
     st.stop()
 
-# Load Orgs
-orgs = fetch_orgs(api_key)
-org_map = {o["name"]: o["id"] for o in orgs}
-org_choice = st.selectbox("Select Organization", list(org_map.keys()))
-org_id = org_map[org_choice]
+orgs = meraki_get("/organizations", api_key)
+org = st.selectbox("Organization", [o["name"] for o in orgs])
+org_id = next(o["id"] for o in orgs if o["name"] == org)
 
-nets = fetch_networks(api_key, org_id)
-net_map = {n["name"]: n["id"] for n in nets}
-net_choice = st.selectbox("Select Network", list(net_map.keys()))
-net_id = net_map[net_choice]
+nets = meraki_get(f"/organizations/{org_id}/networks", api_key)
+net = st.selectbox("Network", [n["name"] for n in nets])
+net_id = next(n["id"] for n in nets if n["name"] == net)
 
-# Get SSID # and Group Policy ID
-ssids = fetch_ssids(api_key, net_id)
+ssids = meraki_get(f"/networks/{net_id}/wireless/ssids", api_key)
 ssid_num = next((s["number"] for s in ssids if s["name"] == "Resident-WiFi"), None)
 if ssid_num is None:
-    st.error("Resident-WiFi SSID not found in selected network.")
+    st.error("SSIID 'Resident-WiFi' not found.")
     st.stop()
 
-gps = fetch_group_policies(api_key, net_id)
-match = [g for g in gps if g["name"] == "Resident_150Mbps"]
-if not match:
-    st.error("Group policy Resident_150Mbps not found.")
+gps = meraki_get(f"/networks/{net_id}/groupPolicies", api_key)
+gp = next((g for g in gps if g["name"]=="Resident_150Mbps"), None)
+if not gp:
+    st.error("Group policy 'Resident_150Mbps' not found.")
     st.stop()
-gp_id = match[0]["groupPolicyId"]
-st.success(f"Using Group Policy ID: {gp_id}")
+gp_id = gp["groupPolicyId"]
+st.success(f"Using groupPolicyId: {gp_id}")
 
-# Prefix & Input Method
-prefix = st.text_input("Prefix before APT number (before '- APT')", value="CC")
-mode = st.radio("Choose input method", ("Manual", "Upload CSV (column 'room')"))
+prefix = st.text_input("Prefix before '- APT'", value="CC")
+mode = st.radio("Input Method", ["Manual", "Upload CSV (room column)"])
 
 units = []
 if mode == "Manual":
-    text = st.text_area("Enter unit numbers (one per line)")
+    text = st.text_area("Enter unit numbers (one per line):")
     units = [l.strip() for l in text.splitlines() if l.strip()]
 else:
-    f = st.file_uploader("Upload CSV", type="csv")
+    f = st.file_uploader("Upload CSV file", type=["csv"])
     if f:
         df = csv.DictReader(io.StringIO(f.getvalue().decode()))
         units = [r["room"].strip() for r in df if r.get("room")]
 
 if not units:
-    st.info("Enter or upload unit numbers to enable button")
+    st.info("Enter unit numbers to proceed")
 else:
-    if st.button("Generate and Upload PSKs"):
-        out = []
+    if st.button("Generate & Provision PSKs"):
+        results = []
         for unit in units:
             name = f"{prefix} - APT {unit}"
-            psk = random_psk()
-            status, res = create_psk(api_key, net_id, ssid_num, name, psk, gp_id)
-            out.append({"unit": unit, "name": name, "psk": psk, "status": status})
-        st.write(out)
-        csv_buf = io.StringIO()
-        writer = csv.DictWriter(csv_buf, fieldnames=["unit","name","psk","status"])
-        writer.writeheader()
-        writer.writerows(out)
-        st.download_button("Download Results CSV", csv_buf.getvalue(), "psk_results.csv", "text/csv")
+            psk = generate_friendly_psk()
+            status, res = meraki_post(
+                f"/networks/{net_id}/wireless/ssids/{ssid_num}/identityPsks",
+                api_key,
+                {"name": name, "passphrase": psk, "groupPolicyId": gp_id}
+            )
+            results.append({"unit":unit, "name":name, "psk":psk, "status":status})
+        st.write(results)
+        buf = io.StringIO()
+        writer = csv.DictWriter(buf, fieldnames=["unit","name","psk","status"])
+        writer.writeheader(); writer.writerows(results)
+        st.download_button("Download CSV", buf.getvalue(), "psk_results.csv", "text/csv")
