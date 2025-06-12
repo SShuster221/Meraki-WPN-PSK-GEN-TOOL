@@ -1,100 +1,102 @@
-
 import streamlit as st
-import requests
-import pandas as pd
-import io
+import requests, csv, io
+import random, string
 
-st.set_page_config(page_title="Meraki WPN PSK Provisioning Tool", layout="centered")
+# Helper functions
+def random_psk():
+    word = ''.join(random.choices(string.ascii_lowercase, k=5))
+    # Make text easy: capitalize first and last
+    return word.capitalize()
 
-st.title("🔐 Meraki WPN PSK Provisioning Tool")
+def fetch_orgs(api_key):
+    r = requests.get("https://api.meraki.com/api/v1/organizations",
+                     headers={"X-Cisco-Meraki-API-Key": api_key})
+    return r.json()
 
-# Step 1: Meraki API Key input
+def fetch_networks(api_key, org_id):
+    r = requests.get(f"https://api.meraki.com/api/v1/organizations/{org_id}/networks",
+                     headers={"X-Cisco-Meraki-API-Key": api_key})
+    return r.json()
+
+def fetch_group_policies(api_key, net_id):
+    r = requests.get(f"https://api.meraki.com/api/v1/networks/{net_id}/groupPolicies",
+                     headers={"X-Cisco-Meraki-API-Key": api_key})
+    return r.json()
+
+def fetch_ssids(api_key, net_id):
+    r = requests.get(f"https://api.meraki.com/api/v1/networks/{net_id}/wireless/ssids",
+                     headers={"X-Cisco-Meraki-API-Key": api_key})
+    return r.json()
+
+def create_psk(api_key, net_id, ssid_num, name, passphrase, groupPolicyId):
+    r = requests.post(
+        f"https://api.meraki.com/api/v1/networks/{net_id}/wireless/ssids/{ssid_num}/identityPsks",
+        headers={"X-Cisco-Meraki-API-Key": api_key},
+        json={"name": name, "passphrase": passphrase, "groupPolicyId": groupPolicyId}
+    )
+    return r.status_code, r.json()
+
+# UI
+st.title("Meraki WPN PSK Provisioning Tool")
+
 api_key = st.text_input("Enter your Meraki API Key", type="password")
-headers = {
-    "X-Cisco-Meraki-API-Key": api_key,
-    "Content-Type": "application/json",
-    "Accept": "application/json"
-}
+if not api_key:
+    st.warning("API Key is required");
+    st.stop()
 
-# Step 2: Get Org and Network
-org_id = None
-net_id = None
+# Load Orgs
+orgs = fetch_orgs(api_key)
+org_map = {o["name"]: o["id"] for o in orgs}
+org_choice = st.selectbox("Select Organization", list(org_map.keys()))
+org_id = org_map[org_choice]
 
-if api_key:
-    org_response = requests.get("https://api.meraki.com/api/v1/organizations", headers=headers)
-    if org_response.status_code == 200:
-        orgs = org_response.json()
-        org_options = {org['name']: org['id'] for org in orgs}
-        selected_org = st.selectbox("Select Organization", list(org_options.keys()))
-        org_id = org_options[selected_org]
+nets = fetch_networks(api_key, org_id)
+net_map = {n["name"]: n["id"] for n in nets}
+net_choice = st.selectbox("Select Network", list(net_map.keys()))
+net_id = net_map[net_choice]
 
-        if org_id:
-            net_response = requests.get(f"https://api.meraki.com/api/v1/organizations/{org_id}/networks", headers=headers)
-            if net_response.status_code == 200:
-                networks = net_response.json()
-                net_options = {net['name']: net['id'] for net in networks}
-                selected_net = st.selectbox("Select Network", list(net_options.keys()))
-                net_id = net_options[selected_net]
+# Get SSID # and Group Policy ID
+ssids = fetch_ssids(api_key, net_id)
+ssid_num = next((s["number"] for s in ssids if s["name"] == "Resident-WiFi"), None)
+if ssid_num is None:
+    st.error("Resident-WiFi SSID not found in selected network.")
+    st.stop()
 
-# Step 3: Prefix input
-prefix = st.text_input("Prefix before APT number (e.g., 'CC')", max_chars=10)
+gps = fetch_group_policies(api_key, net_id)
+match = [g for g in gps if g["name"] == "Resident_150Mbps"]
+if not match:
+    st.error("Group policy Resident_150Mbps not found.")
+    st.stop()
+gp_id = match[0]["groupPolicyId"]
+st.success(f"Using Group Policy ID: {gp_id}")
 
-# Step 4: Choose input method
-input_method = st.radio("Choose input method", ("Manual Entry", "CSV Upload"))
+# Prefix & Input Method
+prefix = st.text_input("Prefix before APT number (before '- APT')", value="CC")
+mode = st.radio("Choose input method", ("Manual", "Upload CSV (column 'room')"))
 
-unit_numbers = []
-if input_method == "Manual Entry":
-    manual_units = st.text_area("Enter unit numbers (one per line)")
-    if manual_units:
-        unit_numbers = manual_units.strip().split("\n")
+units = []
+if mode == "Manual":
+    text = st.text_area("Enter unit numbers (one per line)")
+    units = [l.strip() for l in text.splitlines() if l.strip()]
 else:
-    uploaded_file = st.file_uploader("Upload CSV", type=["csv"])
-    if uploaded_file is not None:
-        df = pd.read_csv(uploaded_file)
-        if 'unit' in df.columns:
-            unit_numbers = df['unit'].astype(str).tolist()
-        else:
-            st.error("CSV must contain a column labeled 'unit'.")
+    f = st.file_uploader("Upload CSV", type="csv")
+    if f:
+        df = csv.DictReader(io.StringIO(f.getvalue().decode()))
+        units = [r["room"].strip() for r in df if r.get("room")]
 
-# Step 5: Generate and upload PSKs
-results = []
-if st.button("Generate and Upload PSKs") and api_key and org_id and net_id and unit_numbers:
-    ssid_name = "Resident-WiFi"
-    group_policy = "Resident_150Mbps"
-
-    ssids = requests.get(f"https://api.meraki.com/api/v1/networks/{net_id}/wireless/ssids", headers=headers)
-    if ssids.status_code == 200:
-        ssids_json = ssids.json()
-        ssid_number = None
-        for ssid in ssids_json:
-            if ssid.get("name") == ssid_name:
-                ssid_number = ssid["number"]
-                break
-
-        if ssid_number is not None:
-            for unit in unit_numbers:
-                name = f"{prefix} APT-{unit}"
-                password = f"{prefix}{unit}!"  # Example password rule
-                payload = {
-                    "name": name,
-                    "passphrase": password,
-                    "groupPolicyId": group_policy
-                }
-                url = f"https://api.meraki.com/api/v1/networks/{net_id}/wireless/ssids/{ssid_number}/identityPsks"
-                res = requests.post(url, headers=headers, json=payload)
-
-                if res.status_code == 201:
-                    results.append({"Unit": unit, "Name": name, "PSK": password, "Status": "✅ Success"})
-                else:
-                    results.append({"Unit": unit, "Name": name, "PSK": password, "Status": f"❌ Failed: {res.text}"})
-        else:
-            st.error(f"SSID '{ssid_name}' not found in network.")
-    else:
-        st.error("Failed to retrieve SSID list.")
-
-# Step 6: Output table and download
-if results:
-    df_out = pd.DataFrame(results)
-    st.dataframe(df_out)
-    csv = df_out.to_csv(index=False).encode('utf-8')
-    st.download_button("Download Result CSV", data=csv, file_name="meraki_psk_results.csv", mime="text/csv")
+if not units:
+    st.info("Enter or upload unit numbers to enable button")
+else:
+    if st.button("Generate and Upload PSKs"):
+        out = []
+        for unit in units:
+            name = f"{prefix} - APT {unit}"
+            psk = random_psk()
+            status, res = create_psk(api_key, net_id, ssid_num, name, psk, gp_id)
+            out.append({"unit": unit, "name": name, "psk": psk, "status": status})
+        st.write(out)
+        csv_buf = io.StringIO()
+        writer = csv.DictWriter(csv_buf, fieldnames=["unit","name","psk","status"])
+        writer.writeheader()
+        writer.writerows(out)
+        st.download_button("Download Results CSV", csv_buf.getvalue(), "psk_results.csv", "text/csv")
